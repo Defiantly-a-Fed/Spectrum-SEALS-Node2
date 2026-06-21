@@ -1,569 +1,668 @@
-"""RF Ragnar Node 2 calibrated detector (Version 1)
+#!/usr/bin/env python3
+"""
+SPECTRUM SEALS - Node 2 RAGNAR RF
+Real-only V4 autowatch / evidence collector for RTL-SDR + HackRF.
 
-This script implements a passive RF detector for the Spectrum SEALS Node 2 using
-the RTL‑SDR (Nooelec NESDR SMArt v5). It captures raw I/Q samples, performs
-FFT analysis, computes baseline noise levels, evaluates peaks using z‑scores,
-and assigns confidence levels to potential signals across multiple ISM bands.
-Results are logged in JSONL format, and a simple HTML dashboard is generated
-showing the current state for each band.
+This file replaces the old RTL-only raw I/Q V1 script while keeping the original
+filename for repo continuity. It does not simulate RF activity and it does not
+claim a confirmed drone identity from weak evidence. It captures real sweep CSV
+artifacts, scores band activity, writes JSONL evidence, and renders a local HTML
+operator page.
 
-The calibrated detector works in two phases:
+Supported lanes:
+  - SEAL-RTL: rtl_test + rtl_power + optional rtl_433
+  - SEAL-HRF: hackrf_info + hackrf_sweep
 
-1. **Calibration**: The receiver learns the ambient noise floor for each band
-   by capturing several measurement cycles without any deliberate transmissions.
-   It computes the median noise floor and peak‑over‑floor levels to set a
-   baseline.
+Typical Windows run:
+  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+  python .\ragnar_rf_node2_v1.py --watch --cycles 3
 
-2. **Live Scan**: After calibration, the detector repeatedly captures I/Q
-   frames for each band, computes the power spectrum, identifies peaks, and
-   compares them to the baseline using median absolute deviation (MAD) to
-   compute a z‑score. Peaks exceeding a configurable z‑score threshold and
-   deviating from the baseline by at least a few dB are treated as abnormal.
-   Confidence scores accumulate over time, and the state transitions through
-   SCAN, TRACK, and LOCK as confidence grows.
+Typical quick checks:
+  python .\ragnar_rf_node2_v1.py --detect
+  python .\ragnar_rf_node2_v1.py --capture-once
 
-Evidence from each scan is recorded in `logs/ragnar_rf_v1_events.jsonl`, and
-human‑readable summaries are saved to `visuals/ragnar_rf_v1_summary.json` and
-`visuals/ragnar_rf_v1_operator.html`.
-
-Prerequisites:
-    pip install numpy
-
-Usage example:
-    python ragnar_rf_node2_v1.py --cycles 12 --calibration-cycles 3 \
-        --capture-seconds 0.45
-
+Outputs:
+  evidence/ragnar_v4_events.jsonl
+  evidence/ragnar_v4_summary.json
+  evidence/ragnar_v4_operator.html
+  evidence/*.csv
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
+import html
 import json
+import os
 import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import median
+from typing import Iterable
 
-import numpy as np
+PROJECT = "SPECTRUM_SEALS"
+NODE_ID = "node2_ragnar_rf"
+SYSTEM = "RAGNAR_V4_AUTOWATCH_REAL_ONLY"
+
+
+@dataclass(frozen=True)
+class SweepBand:
+    key: str
+    label: str
+    lane: str
+    tool: str
+    freq_arg: str
+    start_mhz: float
+    stop_mhz: float
+    step_hz: int
+    seconds: int
+    threshold_db: float
 
 
 @dataclass
-class Band:
-    """Configuration and state for an individual frequency band."""
-
+class ToolStatus:
     name: str
-    center_hz: int
-    sample_rate: int
-    gain_db: float
-    z_lock_threshold: float
-    confidence: float = 0.0
-    baseline_floor_db: float = 0.0
-    baseline_peak_over_floor_db: float = 0.0
-    baseline_ready: bool = False
+    path: str | None
+    found: bool
+    detected: bool | None = None
+    detail: str = ""
 
 
 @dataclass
-class Result:
-    """Container for a single scan result."""
-
+class SweepMetrics:
+    band_key: str
+    label: str
+    lane: str
+    tool: str
+    csv_path: str | None
     timestamp_utc: str
-    band: str
-    center_hz: int
-    peak_hz: float
-    peak_mhz: float
-    noise_floor_db: float
-    peak_power_db: float
-    peak_over_floor_db: float
-    baseline_floor_db: float
-    baseline_peak_over_floor_db: float
-    delta_peak_db: float
+    bins: int
+    rows: int
+    peak_mhz: float | None
+    peak_db: float | None
+    median_db: float | None
+    rel_snr_db: float | None
     activity_percent: float
-    z_score: float
-    confidence: float
-    state: str
-    iq_bytes: int
-    fft_frames: int
+    status: str
+    score: float
+    meaning: str
+    sha256: str | None = None
+    error: str | None = None
 
 
-class CalibratedRFRagnar:
-    """Calibrated RF detector that runs on a Nooelec NESDR (RTL‑SDR)."""
+@dataclass
+class RunState:
+    started_utc: str
+    mode: str
+    tools: dict[str, ToolStatus] = field(default_factory=dict)
+    sweeps: dict[str, SweepMetrics] = field(default_factory=dict)
+    capture_status: str = "IDLE"
+    last_message: str = "ready"
 
-    def __init__(
-        self,
-        root: Path,
-        rtl_sdr: Path,
-        cycles: int,
-        calibration_cycles: int,
-        capture_seconds: float,
-        fft_size: int,
-        hop: int,
-    ) -> None:
-        self.root = root
-        self.rtl_sdr = rtl_sdr
-        self.cycles = cycles
-        self.calibration_cycles = calibration_cycles
-        self.capture_seconds = capture_seconds
-        self.fft_size = fft_size
-        self.hop = hop
 
-        # Working directories
-        self.logs = root / "logs"
-        self.visuals = root / "visuals"
-        self.tmp = root / "tmp"
-        for p in [self.logs, self.visuals, self.tmp]:
-            p.mkdir(parents=True, exist_ok=True)
+BANDS: list[SweepBand] = [
+    SweepBand(
+        key="rtl_433",
+        label="433 MHz ISM",
+        lane="SEAL-RTL",
+        tool="rtl_power",
+        freq_arg="420M:450M:100k",
+        start_mhz=420.0,
+        stop_mhz=450.0,
+        step_hz=100_000,
+        seconds=10,
+        threshold_db=8.0,
+    ),
+    SweepBand(
+        key="rtl_915",
+        label="902-928 MHz ISM",
+        lane="SEAL-RTL",
+        tool="rtl_power",
+        freq_arg="902M:928M:100k",
+        start_mhz=902.0,
+        stop_mhz=928.0,
+        step_hz=100_000,
+        seconds=10,
+        threshold_db=8.0,
+    ),
+    SweepBand(
+        key="hrf_915",
+        label="902-928 MHz HackRF",
+        lane="SEAL-HRF",
+        tool="hackrf_sweep",
+        freq_arg="902:928",
+        start_mhz=902.0,
+        stop_mhz=928.0,
+        step_hz=250_000,
+        seconds=10,
+        threshold_db=8.0,
+    ),
+    SweepBand(
+        key="hrf_24",
+        label="2.4 GHz control/video-adjacent",
+        lane="SEAL-HRF",
+        tool="hackrf_sweep",
+        freq_arg="2400:2500",
+        start_mhz=2400.0,
+        stop_mhz=2500.0,
+        step_hz=1_000_000,
+        seconds=10,
+        threshold_db=7.0,
+    ),
+    SweepBand(
+        key="hrf_58",
+        label="5.8 GHz FPV/video-adjacent",
+        lane="SEAL-HRF",
+        tool="hackrf_sweep",
+        freq_arg="5650:5925",
+        start_mhz=5650.0,
+        stop_mhz=5925.0,
+        step_hz=1_000_000,
+        seconds=10,
+        threshold_db=7.0,
+    ),
+]
 
-        # Output files
-        self.event_log = self.logs / "ragnar_rf_v1_events.jsonl"
-        self.summary_json = self.visuals / "ragnar_rf_v1_summary.json"
-        self.operator_html = self.visuals / "ragnar_rf_v1_operator.html"
-        self.baseline_json = self.visuals / "ragnar_rf_v1_baseline.json"
 
-        # Define the bands to scan
-        self.bands = [
-            Band("315MHz_ISM", 315_000_000, 1_024_000, 32.8, 3.2),
-            Band("433MHz_ISM", 433_920_000, 1_024_000, 32.8, 3.2),
-            Band("868MHz_ISM", 868_000_000, 1_024_000, 32.8, 3.0),
-            Band("915MHz_ISM", 915_000_000, 1_024_000, 32.8, 3.0),
-            Band("1090MHz_ADSB", 1_090_000_000, 1_024_000, 32.8, 2.7),
-        ]
-
-    def capture(self, band: Band) -> Path:
-        """Capture raw I/Q samples for a single band using rtl_sdr."""
-        samples = max(int(band.sample_rate * self.capture_seconds), self.fft_size * 8)
-        out = self.tmp / f"ragnar_v1_{band.name}.u8"
-        if out.exists():
-            out.unlink()
-
-        cmd = [
-            str(self.rtl_sdr),
-            "-d",
-            "0",
-            "-f",
-            str(band.center_hz),
-            "-s",
-            str(band.sample_rate),
-            "-g",
-            str(band.gain_db),
-            "-n",
-            str(samples),
-            str(out),
-        ]
-
-        proc = subprocess.run(
-            cmd,
-            cwd=str(self.root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=max(10, int(self.capture_seconds + 8)),
-            check=False,
+class RFRagnarV4:
+    def __init__(self, root: Path, evidence_dir: Path) -> None:
+        self.root = root.resolve()
+        self.evidence = evidence_dir.resolve()
+        self.logs = self.evidence / "logs"
+        self.evidence.mkdir(parents=True, exist_ok=True)
+        self.logs.mkdir(parents=True, exist_ok=True)
+        self.state = RunState(
+            started_utc=utc_now(),
+            mode=SYSTEM,
+            capture_status="IDLE",
+            last_message="ready",
         )
+        self.events_jsonl = self.evidence / "ragnar_v4_events.jsonl"
+        self.summary_json = self.evidence / "ragnar_v4_summary.json"
+        self.operator_html = self.evidence / "ragnar_v4_operator.html"
 
-        stderr_path = self.logs / f"ragnar_v1_{band.name}_rtl_sdr_stderr.txt"
-        stderr_path.write_text(proc.stderr, encoding="utf-8", errors="replace")
-
-        # Validate output
-        if not out.exists() or out.stat().st_size < self.fft_size * 2:
-            raise RuntimeError(f"I/Q capture failed for {band.name}; see {stderr_path}")
-
-        return out
-
-    def analyze(self, band: Band, iq_path: Path) -> dict:
-        """Analyze captured I/Q and return metrics for the spectrum."""
-        raw = np.fromfile(iq_path, dtype=np.uint8)
-        if raw.size % 2:
-            raw = raw[:-1]
-
-        # Deinterleave and normalize
-        i = raw[0::2].astype(np.float32) - 127.5
-        q = raw[1::2].astype(np.float32) - 127.5
-        iq = (i + 1j * q) / 127.5
-        iq = iq - np.mean(iq)
-
-        frames = []
-        window = np.hanning(self.fft_size).astype(np.float32)
-
-        # Sliding FFT
-        for start in range(0, len(iq) - self.fft_size, self.hop):
-            chunk = iq[start : start + self.fft_size]
-            spectrum = np.fft.fftshift(np.fft.fft(chunk * window))
-            power_db = 20.0 * np.log10(np.abs(spectrum) + 1e-12)
-            frames.append(power_db)
-
-        if not frames:
-            raise RuntimeError(f"Not enough samples for FFT: {band.name}")
-
-        waterfall = np.array(frames, dtype=np.float32)
-        avg = waterfall.mean(axis=0)
-
-        offsets = np.fft.fftshift(np.fft.fftfreq(self.fft_size, d=1.0 / band.sample_rate))
-        absolute = band.center_hz + offsets
-
-        # Ignore DC region to avoid bias
-        usable_mask = np.abs(offsets) > 18_000
-        usable_power = avg[usable_mask]
-        usable_freqs = absolute[usable_mask]
-
-        floor = float(np.median(usable_power))
-        mad = float(np.median(np.abs(usable_power - floor))) + 1e-6
-
-        peak_idx = int(np.argmax(usable_power))
-        peak_power = float(usable_power[peak_idx])
-        peak_hz = float(usable_freqs[peak_idx])
-        peak_over_floor = float(peak_power - floor)
-        z = float((peak_power - floor) / max(mad * 1.4826, 1e-6))
-
-        activity_percent = float(np.mean(usable_power > floor + 6.0) * 100.0)
-
-        return {
-            "iq_bytes": int(raw.size),
-            "fft_frames": int(waterfall.shape[0]),
-            "peak_hz": peak_hz,
-            "peak_mhz": peak_hz / 1_000_000.0,
-            "noise_floor_db": floor,
-            "peak_power_db": peak_power,
-            "peak_over_floor_db": peak_over_floor,
-            "mad_db": mad,
-            "z_score": z,
-            "activity_percent": activity_percent,
+    def write_event(self, event_type: str, payload: dict) -> None:
+        event = {
+            "timestamp_utc": utc_now(),
+            "project": PROJECT,
+            "node_id": NODE_ID,
+            "system": SYSTEM,
+            "event_type": event_type,
+            **payload,
         }
+        with self.events_jsonl.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, sort_keys=True) + "\n")
 
-    def write_jsonl(self, obj: dict) -> None:
-        """Append an event to the JSONL log."""
-        with self.event_log.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(obj) + "\n")
+    def find_tool(self, name: str) -> str | None:
+        candidates: list[Path] = []
+        suffixes = [".exe", ""] if os.name == "nt" else ["", ".exe"]
+        for base in [
+            self.root,
+            self.root / "bin",
+            self.root / "tools",
+            self.root / "tools" / "rtl_sdr" / "bin",
+            self.root / "tools" / "rtl_433" / "bin",
+            self.root / "tools" / "hackrf" / "bin",
+            Path("C:/ProgramData/radioconda/Library/bin"),
+        ]:
+            for suffix in suffixes:
+                candidates.append(base / f"{name}{suffix}")
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return str(candidate)
+        found = shutil.which(name)
+        if found:
+            return found
+        if os.name == "nt":
+            found_exe = shutil.which(f"{name}.exe")
+            if found_exe:
+                return found_exe
+        return None
 
-    def calibrate(self) -> None:
-        """Measure baseline noise floor and peak levels for each band."""
-        print()
-        print("=== RF RAGNAR V1 CALIBRATION ===")
-        print("Keep the RF environment normal. Do not press key fobs yet.")
+    def detect_tools(self) -> dict[str, ToolStatus]:
+        names = ["rtl_test", "rtl_power", "rtl_433", "hackrf_info", "hackrf_sweep"]
+        result: dict[str, ToolStatus] = {}
+        for name in names:
+            path = self.find_tool(name)
+            result[name] = ToolStatus(name=name, path=path, found=bool(path))
 
-        baseline = {}
-        collected = {b.name: [] for b in self.bands}
+        if result["rtl_test"].found:
+            detail, rc = self.run_command([result["rtl_test"].path or "rtl_test", "-t"], timeout=12)
+            result["rtl_test"].detail = trim(detail, 3000)
+            result["rtl_test"].detected = "Found" in detail or "Using device" in detail or "R820T" in detail or rc == 0
 
-        for c in range(self.calibration_cycles):
-            print(f"Calibration pass {c + 1}/{self.calibration_cycles}")
-            for band in self.bands:
-                iq = self.capture(band)
-                a = self.analyze(band, iq)
-                collected[band.name].append(a)
-                print(
-                    f"  {band.name:<12} floor={a['noise_floor_db']:.2f} "
-                    f"p/f={a['peak_over_floor_db']:.2f} z={a['z_score']:.2f}"
-                )
+        if result["hackrf_info"].found:
+            detail, rc = self.run_command([result["hackrf_info"].path or "hackrf_info"], timeout=12)
+            result["hackrf_info"].detail = trim(detail, 3000)
+            result["hackrf_info"].detected = "Found HackRF" in detail or "HackRF One" in detail or rc == 0
 
-        for band in self.bands:
-            rows = collected[band.name]
-            band.baseline_floor_db = float(np.median([r["noise_floor_db"] for r in rows]))
-            band.baseline_peak_over_floor_db = float(
-                np.median([r["peak_over_floor_db"] for r in rows])
+        self.state.tools = result
+        self.state.last_message = "device detection complete"
+        self.write_event("device_detect", {"tools": {k: asdict(v) for k, v in result.items()}})
+        self.save_summary()
+        return result
+
+    def capture_band(self, band: SweepBand) -> SweepMetrics:
+        self.state.capture_status = f"CAPTURING {band.key}"
+        self.state.last_message = f"starting {band.label}"
+        self.save_summary()
+
+        tool_path = self.find_tool(band.tool)
+        if not tool_path:
+            metrics = SweepMetrics(
+                band_key=band.key,
+                label=band.label,
+                lane=band.lane,
+                tool=band.tool,
+                csv_path=None,
+                timestamp_utc=utc_now(),
+                bins=0,
+                rows=0,
+                peak_mhz=None,
+                peak_db=None,
+                median_db=None,
+                rel_snr_db=None,
+                activity_percent=0.0,
+                status="TOOL_MISSING",
+                score=0.0,
+                meaning=f"{band.tool} not found; no claim for this band.",
+                error=f"{band.tool} executable not found",
             )
-            band.baseline_ready = True
-            baseline[band.name] = {
-                "center_hz": band.center_hz,
-                "sample_rate": band.sample_rate,
-                "gain_db": band.gain_db,
-                "baseline_floor_db": band.baseline_floor_db,
-                "baseline_peak_over_floor_db": band.baseline_peak_over_floor_db,
-                "z_lock_threshold": band.z_lock_threshold,
-            }
+            self.state.sweeps[band.key] = metrics
+            self.write_event("capture_error", asdict(metrics))
+            self.state.capture_status = "IDLE"
+            self.state.last_message = metrics.error or "capture error"
+            self.render()
+            self.save_summary()
+            return metrics
 
-        payload = {
-            "project": "SPECTRUM_SEALS",
-            "node": "Node 2",
-            "system": "RF Ragnar v1 calibrated",
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "baseline": baseline,
-        }
-        self.baseline_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        print(f"Baseline saved: {self.baseline_json}")
+        out = self.evidence / f"{utc_slug()}_{band.key}.csv"
+        if band.tool == "rtl_power":
+            cmd = [tool_path, "-f", band.freq_arg, "-i", "1s", "-e", f"{band.seconds}s", str(out)]
+        elif band.tool == "hackrf_sweep":
+            # Frequencies are MHz for hackrf_sweep. -N limits sweeps when supported.
+            cmd = [tool_path, "-f", band.freq_arg, "-w", str(band.step_hz), "-l", "32", "-g", "20", "-N", str(max(3, band.seconds)), "-r", str(out)]
+        else:
+            raise ValueError(f"Unsupported tool: {band.tool}")
 
-    def scan_once(self) -> list[Result]:
-        """Perform a single scan across all bands and return results."""
-        results: list[Result] = []
+        transcript, rc = self.run_command(cmd, timeout=max(20, band.seconds + 20))
+        transcript_path = self.logs / f"{out.stem}_{band.tool}_transcript.txt"
+        transcript_path.write_text(transcript, encoding="utf-8", errors="replace")
 
-        for band in self.bands:
-            iq = self.capture(band)
-            a = self.analyze(band, iq)
-
-            delta_peak = a["peak_over_floor_db"] - band.baseline_peak_over_floor_db
-            abnormal = (
-                a["z_score"] >= band.z_lock_threshold
-                and delta_peak >= 2.0
-                and a["peak_over_floor_db"] >= 4.5
+        if rc != 0 or not out.exists() or out.stat().st_size < 20:
+            metrics = SweepMetrics(
+                band_key=band.key,
+                label=band.label,
+                lane=band.lane,
+                tool=band.tool,
+                csv_path=str(out) if out.exists() else None,
+                timestamp_utc=utc_now(),
+                bins=0,
+                rows=0,
+                peak_mhz=None,
+                peak_db=None,
+                median_db=None,
+                rel_snr_db=None,
+                activity_percent=0.0,
+                status="CAPTURE_FAILED",
+                score=0.0,
+                meaning="No usable sweep artifact was written; no claim for this band.",
+                error=f"return={rc}; transcript={transcript_path}",
             )
+            self.state.sweeps[band.key] = metrics
+            self.write_event("capture_error", asdict(metrics))
+            self.state.capture_status = "IDLE"
+            self.state.last_message = metrics.error or "capture failed"
+            self.render()
+            self.save_summary()
+            return metrics
 
-            # Raw score influences confidence accumulation
-            raw_score = min(
-                100.0,
-                max(
-                    0.0,
-                    (a["z_score"] / 8.0) * 55.0
-                    + delta_peak * 5.0
-                    + min(a["activity_percent"], 20.0),
-                ),
-            )
+        metrics = self.analyze_sweep_csv(band, out)
+        self.state.sweeps[band.key] = metrics
+        self.write_event("sweep_capture", asdict(metrics))
+        self.state.capture_status = "IDLE"
+        self.state.last_message = f"captured {band.label}: {metrics.status}"
+        self.render()
+        self.save_summary()
+        return metrics
 
-            if abnormal:
-                band.confidence = min(100.0, band.confidence * 0.72 + raw_score * 0.48)
+    def capture_once(self) -> list[SweepMetrics]:
+        self.detect_tools()
+        results: list[SweepMetrics] = []
+        for band in BANDS:
+            tool = self.state.tools.get(band.tool)
+            if tool and tool.found:
+                results.append(self.capture_band(band))
             else:
-                band.confidence = max(0.0, band.confidence * 0.55)
-
-            # Determine state based on confidence
-            if band.confidence >= 65.0:
-                state = "LOCK"
-            elif band.confidence >= 25.0:
-                state = "TRACK"
-            else:
-                state = "SCAN"
-
-            result = Result(
-                timestamp_utc=datetime.now(timezone.utc).isoformat(),
-                band=band.name,
-                center_hz=band.center_hz,
-                peak_hz=a["peak_hz"],
-                peak_mhz=a["peak_mhz"],
-                noise_floor_db=a["noise_floor_db"],
-                peak_power_db=a["peak_power_db"],
-                peak_over_floor_db=a["peak_over_floor_db"],
-                baseline_floor_db=band.baseline_floor_db,
-                baseline_peak_over_floor_db=band.baseline_peak_over_floor_db,
-                delta_peak_db=delta_peak,
-                activity_percent=a["activity_percent"],
-                z_score=a["z_score"],
-                confidence=band.confidence,
-                state=state,
-                iq_bytes=a["iq_bytes"],
-                fft_frames=a["fft_frames"],
-            )
-
-            event = {
-                "project": "SPECTRUM_SEALS",
-                "node_id": "node2_rf_ragnar",
-                "event_type": "rf_ragnar_v1_scan",
-                **result.__dict__,
-            }
-            self.write_jsonl(event)
-            results.append(result)
-
+                results.append(self.capture_band(band))
         return results
 
-    def render(self, results: list[Result]) -> None:
-        """Render the results to an HTML file and save summary JSON."""
-        best = max(results, key=lambda r: r.confidence) if results else None
+    def watch(self, cycles: int, interval_seconds: int) -> None:
+        self.detect_tools()
+        self.render()
+        for idx in range(cycles):
+            print(f"\n=== RAGNAR V4 AUTOWATCH CYCLE {idx + 1}/{cycles} ===")
+            results = self.capture_once()
+            print(self.format_console(results))
+            if idx < cycles - 1:
+                time.sleep(max(1, interval_seconds))
 
-        rows = []
-        for r in results:
-            rows.append(
-                f"""
-<tr>
-<td>{r.band}</td>
-<td class=\"{r.state.lower()}\">{r.state}</td>
-<td>{r.peak_mhz:.6f}</td>
-<td>{r.peak_over_floor_db:.2f}</td>
-<td>{r.delta_peak_db:+.2f}</td>
-<td>{r.z_score:.2f}</td>
-<td>{r.activity_percent:.2f}%</td>
-<td>{r.confidence:.1f}%</td>
-<td>{r.iq_bytes:,}</td>
-<td>{r.timestamp_utc}</td>
-</tr>
-"""
+    def analyze_sweep_csv(self, band: SweepBand, path: Path) -> SweepMetrics:
+        values: list[tuple[float, float]] = []
+        rows = 0
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                parsed = parse_sweep_row(row)
+                if not parsed:
+                    continue
+                rows += 1
+                values.extend(parsed)
+
+        if not values:
+            return SweepMetrics(
+                band_key=band.key,
+                label=band.label,
+                lane=band.lane,
+                tool=band.tool,
+                csv_path=str(path),
+                timestamp_utc=utc_now(),
+                bins=0,
+                rows=rows,
+                peak_mhz=None,
+                peak_db=None,
+                median_db=None,
+                rel_snr_db=None,
+                activity_percent=0.0,
+                status="PARSE_FAILED",
+                score=0.0,
+                meaning="CSV existed but no sweep bins were parsed; no claim.",
+                sha256=sha256_file(path),
+                error="no usable bins parsed",
             )
 
-        best_text = "none"
+        powers = [p for _, p in values]
+        med = median(powers)
+        peak_freq, peak_power = max(values, key=lambda item: item[1])
+        rel = peak_power - med
+        active_bins = sum(1 for p in powers if p > med + 6.0)
+        activity_percent = 100.0 * active_bins / max(1, len(powers))
+
+        score = clamp((rel / 16.0) * 70.0 + min(activity_percent, 25.0), 0.0, 100.0)
+        if rel >= band.threshold_db + 8.0:
+            status = "HIGH_RF_ACTIVITY"
+            meaning = "Strong real RF activity in this band. Treat as signal evidence, not identity proof."
+        elif rel >= band.threshold_db:
+            status = "RF_ACTIVITY"
+            meaning = "Real RF activity detected above the local median floor."
+        else:
+            status = "QUIET"
+            meaning = "No strong activity above the detector threshold."
+
+        return SweepMetrics(
+            band_key=band.key,
+            label=band.label,
+            lane=band.lane,
+            tool=band.tool,
+            csv_path=str(path),
+            timestamp_utc=utc_now(),
+            bins=len(values),
+            rows=rows,
+            peak_mhz=peak_freq / 1_000_000.0,
+            peak_db=peak_power,
+            median_db=med,
+            rel_snr_db=rel,
+            activity_percent=activity_percent,
+            status=status,
+            score=score,
+            meaning=meaning,
+            sha256=sha256_file(path),
+            error=None,
+        )
+
+    def save_summary(self) -> None:
+        payload = {
+            "project": PROJECT,
+            "node_id": NODE_ID,
+            "system": SYSTEM,
+            "timestamp_utc": utc_now(),
+            "state": {
+                "started_utc": self.state.started_utc,
+                "mode": self.state.mode,
+                "capture_status": self.state.capture_status,
+                "last_message": self.state.last_message,
+                "tools": {k: asdict(v) for k, v in self.state.tools.items()},
+                "sweeps": {k: asdict(v) for k, v in self.state.sweeps.items()},
+            },
+            "operator_html": str(self.operator_html),
+            "events_jsonl": str(self.events_jsonl),
+        }
+        self.summary_json.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    def render(self) -> None:
+        best = self.best_sweep()
+        tool_rows = []
+        for name in ["rtl_test", "rtl_power", "rtl_433", "hackrf_info", "hackrf_sweep"]:
+            t = self.state.tools.get(name, ToolStatus(name=name, path=None, found=False))
+            detected = "yes" if t.detected is True else "no" if t.detected is False else "n/a"
+            tool_rows.append(
+                f"<tr><td>{esc(name)}</td><td>{'yes' if t.found else 'no'}</td><td>{detected}</td><td>{esc(t.path or '')}</td></tr>"
+            )
+
+        sweep_rows = []
+        for band in BANDS:
+            m = self.state.sweeps.get(band.key)
+            if not m:
+                sweep_rows.append(
+                    f"<tr><td>{esc(band.label)}</td><td>{esc(band.lane)}</td><td>NO_SWEEP_YET</td><td>—</td><td>—</td><td>—</td><td>No claim.</td></tr>"
+                )
+                continue
+            sweep_rows.append(
+                "<tr>"
+                f"<td>{esc(m.label)}</td>"
+                f"<td>{esc(m.lane)}</td>"
+                f"<td class='{css_status(m.status)}'>{esc(m.status)}</td>"
+                f"<td>{fmt(m.peak_mhz, 6)}</td>"
+                f"<td>{fmt(m.rel_snr_db, 2)}</td>"
+                f"<td>{m.score:.1f}%</td>"
+                f"<td>{esc(m.meaning)}</td>"
+                "</tr>"
+            )
+
+        best_text = "No current RF activity track."
         if best:
-            best_text = (
-                f"{best.band} @ {best.peak_mhz:.6f} MHz / "
-                f"{best.confidence:.1f}% / {best.state}"
-            )
+            best_text = f"{best.label}: {best.status} @ {fmt(best.peak_mhz, 6)} MHz / score {best.score:.1f}%"
 
-        html = f"""<!doctype html>
-<html>
+        html_doc = f"""<!doctype html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="2">
-<title>SPECTRUM SEALS RF Ragnar v1</title>
+<meta http-equiv="refresh" content="5">
+<title>SPECTRUM SEALS</title>
 <style>
-body {{
-  background: #060a10;
-  color: #eaf1ff;
-  font-family: Consolas, monospace;
-  margin: 0;
-}}
-.header {{
-  padding: 24px;
-  background: #101722;
-  border-bottom: 1px solid #344055;
-}}
-h1 {{
-  margin: 0 0 8px 0;
-  letter-spacing: 1px;
-}}
-.sub {{
-  color: #b7c6dc;
-}}
-.best {{
-  margin-top: 18px;
-  font-size: 22px;
-  font-weight: 800;
-}}
-.panel {{
-  padding: 18px;
-}}
-table {{
-  width: 100%;
-  border-collapse: collapse;
-}}
-th, td {{
-  border-bottom: 1px solid #273246;
-  padding: 10px;
-  text-align: left;
-}}
-th {{
-  color: #c8d9f2;
-}}
-.scan {{ color: #aab7c8; }}
-.track {{ color: #ffd166; font-weight: 800; }}
-.lock {{ color: #7CFF9B; font-weight: 900; }}
-.footer {{
-  color: #8fa1ba;
-  padding: 18px;
-}}
+:root {{ color-scheme: dark; }}
+body {{ margin:0; background:#07101b; color:#e8eef8; font-family:Inter,Segoe UI,Arial,sans-serif; }}
+header {{ padding:22px 26px; border-bottom:1px solid #23344d; background:#0b1422; }}
+h1 {{ margin:0; font-size:28px; letter-spacing:.08em; }}
+main {{ padding:22px; display:grid; gap:18px; }}
+.card {{ background:#0d1828; border:1px solid #20324b; border-radius:14px; padding:18px; }}
+.kpis {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }}
+.kpi {{ background:#08111d; border:1px solid #20324b; border-radius:12px; padding:14px; }}
+.kpi small {{ display:block; color:#8fb2e5; text-transform:uppercase; font-weight:700; letter-spacing:.12em; }}
+.kpi b {{ display:block; margin-top:8px; font-size:20px; }}
+table {{ width:100%; border-collapse:collapse; }}
+th, td {{ padding:10px; border-bottom:1px solid #20324b; text-align:left; vertical-align:top; }}
+th {{ color:#8fb2e5; font-size:12px; text-transform:uppercase; letter-spacing:.1em; }}
+.ok {{ color:#7dff9b; font-weight:800; }}
+.warn {{ color:#ffd166; font-weight:800; }}
+.bad {{ color:#ff7b7b; font-weight:800; }}
+.muted {{ color:#8fa1ba; }}
+pre {{ white-space:pre-wrap; overflow:auto; background:#050b13; border:1px solid #20324b; border-radius:12px; padding:14px; }}
 </style>
 </head>
 <body>
-<div class="header">
-<h1>SPECTRUM SEALS — RF RAGNAR NODE 2 v1</h1>
-<div class="sub">Calibrated passive RTL-SDR I/Q hunter • baseline floor • z-score peaks • confidence tracker • JSONL evidence</div>
-<div class="best">Best current track: {best_text}</div>
-</div>
-<div class="panel">
-<table>
-<thead>
-<tr>
-<th>Band</th>
-<th>State</th>
-<th>Peak MHz</th>
-<th>Peak/Floor dB</th>
-<th>Δ Baseline</th>
-<th>Z</th>
-<th>Activity</th>
-<th>Confidence</th>
-<th>I/Q Bytes</th>
-<th>UTC</th>
-</tr>
-</thead>
-<tbody>
-{''.join(rows)}
-</tbody>
-</table>
-</div>
-<div class="footer">
-Baseline: {self.baseline_json}<br>
-Evidence log: {self.event_log}<br>
-Summary: {self.summary_json}
-</div>
+<header><h1>SPECTRUM SEALS</h1></header>
+<main>
+<section class="kpis">
+<div class="kpi"><small>Mode</small><b>{esc(self.state.mode)}</b></div>
+<div class="kpi"><small>Capture</small><b>{esc(self.state.capture_status)}</b></div>
+<div class="kpi"><small>Best track</small><b>{esc(best_text)}</b></div>
+<div class="kpi"><small>Updated</small><b>{esc(utc_now())}</b></div>
+</section>
+<section class="card"><h2>Drone-band RF watch</h2><table><thead><tr><th>Band</th><th>Lane</th><th>Status</th><th>Peak MHz</th><th>Rel SNR dB</th><th>Score</th><th>Meaning</th></tr></thead><tbody>{''.join(sweep_rows)}</tbody></table></section>
+<section class="card"><h2>Tool and hardware status</h2><table><thead><tr><th>Tool</th><th>Found</th><th>Hardware detected</th><th>Path</th></tr></thead><tbody>{''.join(tool_rows)}</tbody></table></section>
+<section class="card"><h2>Latest message</h2><pre>{esc(self.state.last_message)}</pre></section>
+<section class="card"><h2>Evidence</h2><pre>Summary: {esc(str(self.summary_json))}\nEvents: {esc(str(self.events_jsonl))}\nHTML: {esc(str(self.operator_html))}</pre></section>
+</main>
 </body>
 </html>
 """
+        self.operator_html.write_text(html_doc, encoding="utf-8")
 
-        self.operator_html.write_text(html, encoding="utf-8")
+    def best_sweep(self) -> SweepMetrics | None:
+        candidates = [m for m in self.state.sweeps.values() if m.score > 0 and m.status not in {"TOOL_MISSING", "CAPTURE_FAILED", "PARSE_FAILED"}]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda m: m.score)
 
-        summary = {
-            "project": "SPECTRUM_SEALS",
-            "node": "Node 2",
-            "system": "RF Ragnar v1 calibrated",
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "receiver": "Nooelec NESDR SMArt v5 / RTL2832U + R820T",
-            "best_track": best.__dict__ if best else None,
-            "results": [r.__dict__ for r in results],
-            "operator_html": str(self.operator_html),
-            "event_log": str(self.event_log),
-        }
-        self.summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
-    def print_table(self, idx: int, results: list[Result]) -> None:
-        """Print a human-readable table to stdout."""
-        print()
-        print(f"=== RF RAGNAR V1 CYCLE {idx + 1}/{self.cycles} ===")
-        print(
-            f"{'BAND':<14} {'STATE':<7} {'PEAK MHz':>12} {'P/F':>7} {'DELTA':>8} "
-            f"{'Z':>7} {'ACT':>8} {'CONF':>8}"
-        )
-        for r in results:
-            print(
-                f"{r.band:<14} {r.state:<7} {r.peak_mhz:>12.6f} "
-                f"{r.peak_over_floor_db:>7.2f} {r.delta_peak_db:>+8.2f} "
-                f"{r.z_score:>7.2f} {r.activity_percent:>7.2f}% {r.confidence:>7.1f}%"
+    def format_console(self, results: Iterable[SweepMetrics]) -> str:
+        lines = ["BAND                           LANE       STATUS            PEAK MHz      REL SNR   SCORE"]
+        for m in results:
+            lines.append(
+                f"{m.label[:30]:<30} {m.lane:<10} {m.status:<17} {fmt(m.peak_mhz, 6):>10} {fmt(m.rel_snr_db, 2):>9} {m.score:>6.1f}%"
             )
-        print(f"HTML: {self.operator_html}")
+        lines.append(f"HTML: {self.operator_html}")
+        return "\n".join(lines)
 
-    def run(self) -> None:
-        """Execute calibration and scanning cycles."""
-        self.calibrate()
-
-        print()
-        print("=== RF RAGNAR V1 LIVE HUNT ===")
-        print(
-            "Now cause a legal local signal if you have one: car key fob, 433 weather sensor, "
-            "garage remote, ADS-B nearby, etc. Press Ctrl+C to stop after the current capture."
-        )
-        latest: list[Result] = []
-
+    def run_command(self, cmd: list[str], timeout: int) -> tuple[str, int]:
         try:
-            for i in range(self.cycles):
-                latest = self.scan_once()
-                self.render(latest)
-                self.print_table(i, latest)
-        except KeyboardInterrupt:
-            print("Stopped by operator.")
-            if latest:
-                self.render(latest)
+            proc = subprocess.run(
+                cmd,
+                cwd=str(self.root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            combined = f"$ {' '.join(cmd)}\n\nSTDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+            return combined, proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout or ""
+            err = exc.stderr or ""
+            if isinstance(out, bytes):
+                out = out.decode("utf-8", errors="replace")
+            if isinstance(err, bytes):
+                err = err.decode("utf-8", errors="replace")
+            return f"TIMEOUT after {timeout}s\nSTDOUT:\n{out}\nSTDERR:\n{err}", 124
+        except OSError as exc:
+            return f"OS error running command: {exc}", 127
 
 
-def find_rtl_sdr(root: Path) -> Path:
-    """Find rtl_sdr executable in the project or system path."""
-    local = list((root / "bin").rglob("rtl_sdr.exe"))
-    if local:
-        return local[0]
-    path = shutil.which("rtl_sdr")
-    if path:
-        return Path(path)
-    raise FileNotFoundError(
-        f"rtl_sdr.exe not found. Put rtl_sdr.exe and DLLs in {root / 'bin'}"
-    )
+def parse_sweep_row(row: list[str]) -> list[tuple[float, float]] | None:
+    if len(row) < 7:
+        return None
+    try:
+        low = float(row[2].strip())
+        high = float(row[3].strip())
+        step = float(row[4].strip())
+    except ValueError:
+        return None
+    powers: list[float] = []
+    for item in row[6:]:
+        try:
+            powers.append(float(item.strip()))
+        except ValueError:
+            continue
+    if not powers or step <= 0 or high <= low:
+        return None
+    return [(low + step * idx, power) for idx, power in enumerate(powers)]
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--root", default=".")
-    parser.add_argument("--cycles", type=int, default=12)
-    parser.add_argument("--calibration-cycles", type=int, default=3)
-    parser.add_argument("--capture-seconds", type=float, default=0.45)
-    parser.add_argument("--fft-size", type=int, default=2048)
-    parser.add_argument("--hop", type=int, default=1024)
-    args = parser.parse_args()
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+
+def utc_slug() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def trim(text: str, max_chars: int) -> str:
+    return text if len(text) <= max_chars else text[:max_chars] + "\n...trimmed..."
+
+
+def esc(value: object) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def fmt(value: float | None, digits: int) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.{digits}f}"
+
+
+def css_status(status: str) -> str:
+    if status in {"RF_ACTIVITY", "HIGH_RF_ACTIVITY"}:
+        return "warn"
+    if status in {"QUIET"}:
+        return "ok"
+    return "bad"
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="SPECTRUM SEALS Node 2 RAGNAR RF real-only autowatch")
+    parser.add_argument("--root", default=".", help="Project root directory")
+    parser.add_argument("--evidence-dir", default="evidence", help="Evidence output directory")
+    parser.add_argument("--detect", action="store_true", help="Only detect tools/devices and exit")
+    parser.add_argument("--capture-once", action="store_true", help="Capture all supported bands once and exit")
+    parser.add_argument("--watch", action="store_true", help="Run automatic RF watch cycles")
+    parser.add_argument("--cycles", type=int, default=1, help="Number of watch cycles")
+    parser.add_argument("--interval", type=int, default=5, help="Seconds between watch cycles")
+    return parser
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
     root = Path(args.root).resolve()
-    rtl = find_rtl_sdr(root)
+    app = RFRagnarV4(root=root, evidence_dir=root / args.evidence_dir)
 
-    app = CalibratedRFRagnar(
-        root=root,
-        rtl_sdr=rtl,
-        cycles=args.cycles,
-        calibration_cycles=args.calibration_cycles,
-        capture_seconds=args.capture_seconds,
-        fft_size=args.fft_size,
-        hop=args.hop,
-    )
-    app.run()
+    if args.detect:
+        tools = app.detect_tools()
+        app.render()
+        app.save_summary()
+        print(json.dumps({k: asdict(v) for k, v in tools.items()}, indent=2))
+        print(f"HTML: {app.operator_html}")
+        return 0
+
+    if args.capture_once:
+        results = app.capture_once()
+        print(app.format_console(results))
+        return 0
+
+    if args.watch or not (args.detect or args.capture_once):
+        app.watch(cycles=max(1, args.cycles), interval_seconds=max(1, args.interval))
+        return 0
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
